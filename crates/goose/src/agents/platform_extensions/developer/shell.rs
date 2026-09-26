@@ -136,6 +136,15 @@ pub fn shell_display_name() -> String {
     shell_basename(&unix_shell())
 }
 
+/// cmd.exe runs only the first line of a `/C` command and still exits 0, so a
+/// newline with non-whitespace content on both sides silently drops everything
+/// after the first line. Leading and trailing line breaks are safe: cmd skips
+/// leading line breaks and nothing follows a trailing one.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn rejects_multiline_command(shell: &str, command: &str) -> bool {
+    shell == "cmd" && command.trim().contains(['\n', '\r'])
+}
+
 /// The shell tool runs commands with `-c "..."`, and LLMs routinely emit
 /// POSIX-style patterns such as heredocs (`cat <<EOF > file`), `$VAR`
 /// expansion, and `2>&1` redirection. Non-POSIX shells (fish, csh, tcsh,
@@ -390,7 +399,7 @@ impl ShellTool {
         }
 
         #[cfg(windows)]
-        if shell_basename(&windows_shell()) == "cmd" && params.command.contains(['\n', '\r']) {
+        if rejects_multiline_command(&shell_basename(&windows_shell()), &params.command) {
             return Self::error_result(
                 "cmd.exe silently truncates commands at newlines — only the first line executes, \
                  with exit code 0. Use `&` to chain commands on one line \
@@ -1282,6 +1291,68 @@ mod tests {
         }
     }
 
+    #[test]
+    fn cmd_rejects_interior_newlines() {
+        for command in [
+            "echo a\necho b",
+            "echo a\r\necho b",
+            "echo a\recho b",
+            "echo a\n\necho b",
+            "echo a\necho b\n",
+        ] {
+            assert!(rejects_multiline_command("cmd", command), "{command:?}");
+        }
+    }
+
+    #[test]
+    fn cmd_accepts_single_line_command() {
+        assert!(!rejects_multiline_command("cmd", "echo a & echo b"));
+    }
+
+    #[test]
+    fn cmd_accepts_leading_newlines() {
+        for command in [
+            "\necho a",
+            "\r\necho a",
+            "\recho a",
+            "\n\necho a",
+            "\necho a\n",
+        ] {
+            assert!(!rejects_multiline_command("cmd", command), "{command:?}");
+        }
+    }
+
+    #[test]
+    fn cmd_accepts_trailing_lf() {
+        for command in ["echo a\n", "echo a\n   "] {
+            assert!(!rejects_multiline_command("cmd", command), "{command:?}");
+        }
+    }
+
+    #[test]
+    fn cmd_accepts_trailing_crlf() {
+        for command in ["echo a\r\n", "echo a\n\r\n"] {
+            assert!(!rejects_multiline_command("cmd", command), "{command:?}");
+        }
+    }
+
+    #[test]
+    fn cmd_accepts_trailing_cr() {
+        assert!(!rejects_multiline_command("cmd", "echo a\r"));
+    }
+
+    #[test]
+    fn non_cmd_shells_accept_multiline_commands() {
+        for shell in ["powershell", "pwsh", "bash"] {
+            for command in ["echo a\necho b", "echo a\r\necho b", "echo a\recho b"] {
+                assert!(
+                    !rejects_multiline_command(shell, command),
+                    "{shell}: {command:?}"
+                );
+            }
+        }
+    }
+
     #[cfg(windows)]
     #[tokio::test]
     async fn cmd_rejects_newline_in_command() {
@@ -1303,6 +1374,34 @@ mod tests {
                 "error should mention cmd.exe for {command:?}"
             );
         }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn cmd_runs_command_with_trailing_newline() {
+        let tool = ShellTool::new_for_test().unwrap();
+        let result = tool
+            .shell(ShellParams {
+                command: "echo hello\r\n".to_string(),
+                timeout_secs: None,
+            })
+            .await;
+        assert_eq!(result.is_error, Some(false));
+        assert!(extract_text(&result).contains("hello"));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn cmd_runs_command_with_leading_newline() {
+        let tool = ShellTool::new_for_test().unwrap();
+        let result = tool
+            .shell(ShellParams {
+                command: "\r\necho hello".to_string(),
+                timeout_secs: None,
+            })
+            .await;
+        assert_eq!(result.is_error, Some(false));
+        assert!(extract_text(&result).contains("hello"));
     }
 
     #[test]
